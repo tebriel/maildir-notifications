@@ -2,20 +2,22 @@
 import json
 import sys
 import argparse
-import mailbox
-import email
+import socket
+from datetime import datetime, timezone
 from email.mime.text import MIMEText
-from pathlib import Path
 from getpass import getuser, getpass
 import keyring
 from github3 import authorize, login, notifications
+
+from mnotifications.mail import Mail
 
 APP_NAME = 'mnotifications'
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Fetch github notifications and store them in a maildir format')
-    parser.add_argument('--clean', help='Remove your credentials', action=argparse.BooleanOptionalAction)
-    parser.add_argument('--echo-token', help='Echo your token to the cli', action=argparse.BooleanOptionalAction)
+    parser.add_argument('--clean', help='Remove your credentials', action='store_true')
+    parser.add_argument('--empty', help='Remove your credentials', action='store_true')
+    parser.add_argument('--echo-token', help='Echo your token to the cli', action='store_true')
     return parser.parse_args()
 
 def echo_token() -> None:
@@ -41,11 +43,16 @@ def clean() -> None:
 
 def main():
     args = parse_args()
+    if args.empty:
+        Mail.empty()
+
     if args.clean:
         clean()
     elif args.echo_token:
         echo_token()
     else:
+        mail = Mail()
+        mail.connect()
         user: str = getuser()
         cred = keyring.get_credential(APP_NAME, user)
         if cred is None:
@@ -53,35 +60,24 @@ def main():
             keyring.set_password(APP_NAME, user, token)
             cred = keyring.get_credential(APP_NAME, user)
 
-        [auth_id, token] = cred.password.split(':')
+        [_, token] = cred.password.split(':')
+        start = datetime.now(tz=timezone.utc)
         gh = login(token=token)
-        print(gh.user('tebriel').id)
-        maildir = get_maildir()
-        maildir = maildir.get_folder('INBOX')
-        for n in gh.notifications():
+
+        params = {"all": "true"}
+
+        last_run = mail.db.get_last_update()
+        if last_run:
+            params["since"] = last_run.isoformat()
+        print(params)
+
+        url = gh._build_url("notifications")
+        for n in gh._iter(
+            int(-1), url, notifications.Thread, params, etag=None
+        ):
             print(n)
-            add_notification(maildir, n)
-
-
-def get_maildir() -> mailbox.Maildir:
-    m = mailbox.Maildir(Path.home().joinpath('.mail', 'github-notifications'), create=True)
-    if 'INBOX' not in m.list_folders():
-        print('Creating INBOX folder')
-        m.add_folder('INBOX')
-    return m
-
-def add_notification(m: mailbox.Maildir, notification: notifications.Thread) -> None:
-    text = MIMEText(json.dumps(notification.as_dict(), indent=2))
-    text['From'] = '{0}/{1}'.format(notification.repository.owner, notification.repository.name)
-    text['Subject'] = notification.subject['title']
-    text['Date'] = notification.updated_at.isoformat()
-    if notification.subject['type'] == 'PullRequest':
-        pass
-
-
-    message = mailbox.MaildirMessage(message=text)
-    m.add(message)
-    m.flush()
+            mail.add_notification(n)
+        mail.db.set_last_update(start)
 
 
 def get_2fa() -> str:
